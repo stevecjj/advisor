@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TSLA Covered Call Advisor</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif; background: #f8fafc; }
+    input[type=number] { -moz-appearance: textfield; }
+    input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-appearance: none; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+    @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+    .animate-in { animation: slideUp 0.4s ease-out; }
+    .pulse { animation: pulse 1.5s infinite; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useCallback } = React;
+
+    // ============================================================
+    // BLACK-SCHOLES MATH
+    // ============================================================
+    function erf(x) {
+      const a1=0.254829592, a2=-0.284496736, a3=1.421413741;
+      const a4=-1.453152027, a5=1.061405429, p=0.3275911;
+      const sign = x < 0 ? -1 : 1;
+      x = Math.abs(x);
+      const t = 1/(1+p*x);
+      const y = 1-((((a5*t+a4)*t+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);
+      return sign * y;
+    }
+
+    function normCDF(x) { return 0.5*(1+erf(x/Math.sqrt(2))); }
+
+    function bsCall(S,K,T,r,sigma) {
+      if (T<=0) return Math.max(0,S-K);
+      const d1 = (Math.log(S/K)+(r+sigma*sigma/2)*T)/(sigma*Math.sqrt(T));
+      const d2 = d1 - sigma*Math.sqrt(T);
+      return S*normCDF(d1) - K*Math.exp(-r*T)*normCDF(d2);
+    }
+
+    // ============================================================
+    // STRATEGY ENGINE
+    // ============================================================
+    function calculateStrategy(price, iv, sma50, prevReturn, earningsNearby) {
+      let regime, baseOtm, posPct;
+      if (iv < 0.35)      { regime="LOW";     baseOtm=0.04; posPct="100%"; }
+      else if (iv < 0.55)  { regime="MID";     baseOtm=0.06; posPct="85%"; }
+      else if (iv < 0.75)  { regime="HIGH";    baseOtm=0.10; posPct="60%"; }
+      else                 { regime="EXTREME"; baseOtm=0.15; posPct="35% or SKIP"; }
+
+      let momentumAdj = 0;
+      if (prevReturn > 0.05) momentumAdj = 0.03;
+      else if (prevReturn > 0.02) momentumAdj = 0.015;
+      else if (prevReturn < -0.05) momentumAdj = -0.015;
+
+      let trendAdj = 0;
+      if (sma50 && price > sma50*1.03) trendAdj = 0.02;
+      else if (sma50 && price < sma50*0.97) trendAdj = -0.01;
+
+      const earningsAdj = earningsNearby ? 0.03 : 0;
+      const totalOtm = baseOtm + momentumAdj + trendAdj + earningsAdj;
+
+      let strike = Math.round((price*(1+totalOtm))/5)*5;
+      if (strike <= price) strike = Math.ceil(price/5)*5 + 5;
+
+      const shouldSkip = regime==="EXTREME" && sma50 && price < sma50*0.95;
+      const T = 14/365;
+      const premium = bsCall(price, strike, T, 0.045, iv);
+      const d1 = (Math.log(price/strike)+(0.045+iv*iv/2)*T)/(iv*Math.sqrt(T));
+      const delta = normCDF(d1);
+      const expectedMove = price * iv * Math.sqrt(T);
+      const probOTM = 1 - normCDF((Math.log(price/strike)+(0.045-iv*iv/2)*T)/(iv*Math.sqrt(T)));
+
+      return { regime, baseOtm, momentumAdj, trendAdj, earningsAdj, totalOtm,
+               strike, posPct, shouldSkip, premium: Math.max(0,premium),
+               delta, expectedMove, probOTM };
+    }
+
+    // ============================================================
+    // API PROMPT
+    // ============================================================
+    const PROMPT = `You are a financial data assistant. Search the web for the CURRENT data for Tesla (TSLA) stock right now.
+
+Find these 5 data points:
+1. Current TSLA stock price (latest closing or real-time)
+2. TSLA 30-day implied volatility (IV) as a decimal
+3. TSLA 50-day simple moving average (SMA)
+4. TSLA stock price from 2 weeks ago
+5. Is there a TSLA earnings report within the next 30 days? (true/false)
+
+Respond ONLY with a JSON object, no markdown, no backticks, no explanation:
+{"price": 413.00, "iv30d": 0.413, "sma50": 430.00, "price_2w_ago": 428.00, "earnings_nearby": false, "data_date": "2026-02-19", "sources": "Yahoo Finance, Barchart"}`;
+
+    // ============================================================
+    // MAIN APP
+    // ============================================================
+    const regimeColors = {
+      LOW:     { bg:"#eff6ff", border:"#3b82f6", text:"#1d4ed8", label:"Low Vol" },
+      MID:     { bg:"#f0fdf4", border:"#22c55e", text:"#15803d", label:"Mid Vol" },
+      HIGH:    { bg:"#fffbeb", border:"#f59e0b", text:"#b45309", label:"High Vol" },
+      EXTREME: { bg:"#fef2f2", border:"#ef4444", text:"#b91c1c", label:"Extreme" },
+    };
+
+    function App() {
+      const [status, setStatus] = useState("idle");
+      const [marketData, setMarketData] = useState(null);
+      const [strategy, setStrategy] = useState(null);
+      const [errorMsg, setErrorMsg] = useState("");
+      const [manualMode, setManualMode] = useState(false);
+      const [apiKey, setApiKey] = useState(() => {
+        try { return localStorage.getItem("anthropic_key") || ""; } catch(e) { return ""; }
+      });
+      const [showKey, setShowKey] = useState(false);
+      const [manual, setManual] = useState({
+        price:413, iv:0.413, sma50:430, price2w:428, earnings:false
+      });
+
+      // History stored in localStorage
+      const [history, setHistory] = useState(() => {
+        try {
+          const saved = localStorage.getItem("tsla_cc_history");
+          return saved ? JSON.parse(saved) : [];
+        } catch(e) { return []; }
+      });
+
+      const saveHistory = (entry) => {
+        const updated = [entry, ...history].slice(0, 52);
+        setHistory(updated);
+        try { localStorage.setItem("tsla_cc_history", JSON.stringify(updated)); } catch(e) {}
+      };
+
+      const saveApiKey = (key) => {
+        setApiKey(key);
+        try { localStorage.setItem("anthropic_key", key); } catch(e) {}
+      };
+
+      const processData = (mktData) => {
+        setMarketData(mktData);
+        const prevReturn = (mktData.price - mktData.price2wAgo) / mktData.price2wAgo;
+        const strat = calculateStrategy(mktData.price, mktData.iv, mktData.sma50, prevReturn, mktData.earningsNearby);
+        setStrategy(strat);
+        setStatus("done");
+
+        saveHistory({
+          date: mktData.dataDate,
+          price: mktData.price,
+          iv: mktData.iv,
+          strike: strat.strike,
+          regime: strat.regime,
+          premium: strat.premium,
+          otm: strat.totalOtm,
+        });
+      };
+
+      const fetchLiveData = useCallback(async () => {
+        if (!apiKey.trim()) {
+          setErrorMsg("Please enter your Anthropic API key above first.");
+          setStatus("error");
+          return;
+        }
+        setStatus("fetching");
+        setErrorMsg("");
+
+        try {
+          const resp = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": apiKey.trim(),
+              "anthropic-version": "2023-06-01",
+              "anthropic-dangerous-direct-browser-access": "true",
+            },
+            body: JSON.stringify({
+              model: "claude-sonnet-4-20250514",
+              max_tokens: 1000,
+              messages: [{ role: "user", content: PROMPT }],
+              tools: [{ type: "web_search_20250305", name: "web_search" }],
+            }),
+          });
+
+          if (!resp.ok) {
+            const errData = await resp.json().catch(() => ({}));
+            throw new Error(errData.error?.message || `API error ${resp.status}`);
+          }
+
+          const data = await resp.json();
+          const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("\n") || "";
+
+          const jsonMatch = text.match(/\{[^{}]*\}/);
+          if (!jsonMatch) throw new Error("Could not parse market data. Try again or use manual mode.");
+
+          const parsed = JSON.parse(jsonMatch[0]);
+          if (!parsed.price || !parsed.iv30d) throw new Error("Missing price or IV in response. Try again.");
+
+          processData({
+            price: parsed.price,
+            iv: parsed.iv30d > 1 ? parsed.iv30d / 100 : parsed.iv30d,
+            sma50: parsed.sma50 || parsed.price * 1.02,
+            price2wAgo: parsed.price_2w_ago || parsed.price,
+            earningsNearby: parsed.earnings_nearby || false,
+            dataDate: parsed.data_date || new Date().toISOString().split("T")[0],
+            sources: parsed.sources || "Web search",
+          });
+        } catch (err) {
+          setErrorMsg(err.message);
+          setStatus("error");
+        }
+      }, [apiKey, history]);
+
+      const runManual = () => {
+        processData({
+          price: manual.price, iv: manual.iv, sma50: manual.sma50,
+          price2wAgo: manual.price2w, earningsNearby: manual.earnings,
+          dataDate: new Date().toISOString().split("T")[0],
+          sources: "Manual input",
+        });
+      };
+
+      const rc = strategy ? regimeColors[strategy.regime] : null;
+
+      return (
+        <div style={{ maxWidth: 820, margin: "0 auto", padding: "16px 20px" }}>
+
+          {/* HEADER */}
+          <div style={{
+            background: "linear-gradient(135deg, #0f172a, #1e3a5f)",
+            borderRadius: 14, padding: "20px 24px", marginBottom: 20,
+            color: "white", textAlign: "center",
+          }}>
+            <div style={{ fontSize: 10, letterSpacing: 3, opacity: 0.5 }}>LIVE STRATEGY ADVISOR</div>
+            <div style={{ fontSize: 24, fontWeight: 800, marginTop: 4 }}>TSLA Covered Call</div>
+            <div style={{ fontSize: 12, opacity: 0.6, marginTop: 4 }}>
+              Auto-fetch live data · IV-adaptive strike calculation · Trade log
+            </div>
+          </div>
+
+          {/* API KEY INPUT */}
+          <div style={{
+            background: "white", borderRadius: 10, padding: "14px 18px",
+            marginBottom: 16, border: "1px solid #e2e8f0",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontSize: 12, fontWeight: 600, color: "#64748b", whiteSpace: "nowrap" }}>
+                🔑 Anthropic API Key
+              </span>
+              <input
+                type={showKey ? "text" : "password"}
+                value={apiKey}
+                onChange={e => saveApiKey(e.target.value)}
+                placeholder="sk-ant-..."
+                style={{
+                  flex: 1, padding: "8px 12px", borderRadius: 6,
+                  border: "1px solid #cbd5e1", fontSize: 13,
+                  fontFamily: "monospace",
+                }}
+              />
+              <button onClick={() => setShowKey(!showKey)} style={{
+                padding: "6px 10px", borderRadius: 6, border: "1px solid #cbd5e1",
+                background: "white", cursor: "pointer", fontSize: 12,
+              }}>{showKey ? "Hide" : "Show"}</button>
+            </div>
+            <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 6 }}>
+              Stored locally in your browser only. Get yours at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener" style={{ color: "#3b82f6" }}>console.anthropic.com</a>. Needs web search enabled on your plan.
+            </div>
+          </div>
+
+          {/* MODE TOGGLE */}
+          <div style={{ display: "flex", gap: 8, justifyContent: "center", marginBottom: 16 }}>
+            {[
+              { mode: false, icon: "🌐", label: "Auto-Fetch" },
+              { mode: true, icon: "✏️", label: "Manual Input" },
+            ].map(({ mode, icon, label }) => (
+              <button key={label} onClick={() => setManualMode(mode)} style={{
+                padding: "9px 20px", borderRadius: 8, border: "none",
+                background: manualMode === mode ? "#1e3a5f" : "#e2e8f0",
+                color: manualMode === mode ? "white" : "#475569",
+                fontWeight: 600, fontSize: 13, cursor: "pointer",
+              }}>{icon} {label}</button>
+            ))}
+          </div>
+
+          {/* AUTO-FETCH */}
+          {!manualMode && (
+            <div style={{ textAlign: "center", marginBottom: 20 }}>
+              <button onClick={fetchLiveData} disabled={status==="fetching"} style={{
+                padding: "14px 44px", borderRadius: 10, border: "none",
+                background: status==="fetching"
+                  ? "linear-gradient(135deg,#94a3b8,#64748b)"
+                  : "linear-gradient(135deg,#16a34a,#15803d)",
+                color: "white", fontWeight: 700, fontSize: 15, cursor: status==="fetching"?"wait":"pointer",
+                boxShadow: "0 4px 14px rgba(22,163,74,0.25)",
+              }}>
+                {status==="fetching" ? (
+                  <span className="pulse">⏳ Searching the web for live TSLA data...</span>
+                ) : "🔍 Fetch Live Data & Calculate Strike"}
+              </button>
+            </div>
+          )}
+
+          {/* MANUAL MODE */}
+          {manualMode && (
+            <div style={{
+              background: "white", borderRadius: 12, padding: 20,
+              border: "1px solid #e2e8f0", marginBottom: 20,
+            }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                {[
+                  { key:"price", label:"TSLA Price ($)", step:0.01 },
+                  { key:"iv", label:"30D IV (decimal, e.g. 0.41)", step:0.001 },
+                  { key:"sma50", label:"50-Day SMA ($)", step:0.01 },
+                  { key:"price2w", label:"Price 2 Weeks Ago ($)", step:0.01 },
+                ].map(({ key, label, step }) => (
+                  <div key={key}>
+                    <label style={{ fontSize: 11, fontWeight: 600, color: "#64748b" }}>{label}</label>
+                    <input type="number" step={step} value={manual[key]}
+                      onChange={e => setManual(p => ({...p, [key]: parseFloat(e.target.value)||0}))}
+                      style={{
+                        width: "100%", padding: "8px 12px", borderRadius: 6,
+                        border: "2px solid #93c5fd", fontSize: 14, fontWeight: 600,
+                        color: "#0000FF", background: "#e8f0fe", marginTop: 4,
+                      }}
+                    />
+                  </div>
+                ))}
+                <div style={{ gridColumn: "1 / -1" }}>
+                  <label style={{ fontSize: 11, fontWeight: 600, color: "#64748b" }}>Earnings within 30 days?</label>
+                  <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                    {[false, true].map(v => (
+                      <button key={String(v)} onClick={() => setManual(p => ({...p, earnings: v}))} style={{
+                        flex: 1, padding: 8, borderRadius: 6,
+                        border: manual.earnings===v ? "2px solid #1e3a5f" : "1px solid #cbd5e1",
+                        background: manual.earnings===v ? "#1e3a5f" : "white",
+                        color: manual.earnings===v ? "white" : "#475569",
+                        fontWeight: 600, cursor: "pointer",
+                      }}>{v ? "YES":"NO"}</button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <button onClick={runManual} style={{
+                width: "100%", marginTop: 16, padding: 12, borderRadius: 8, border: "none",
+                background: "linear-gradient(135deg,#16a34a,#15803d)",
+                color: "white", fontWeight: 700, fontSize: 14, cursor: "pointer",
+              }}>Calculate Strike →</button>
+            </div>
+          )}
+
+          {/* ERROR */}
+          {status === "error" && (
+            <div className="animate-in" style={{
+              background: "#fef2f2", border: "1px solid #fca5a5", borderRadius: 10,
+              padding: 16, marginBottom: 20,
+            }}>
+              <div style={{ fontWeight: 700, color: "#b91c1c", marginBottom: 4 }}>⚠ Error</div>
+              <div style={{ fontSize: 13, color: "#991b1b" }}>{errorMsg}</div>
+              <div style={{ fontSize: 12, color: "#64748b", marginTop: 6 }}>
+                Try again or switch to Manual Input mode.
+              </div>
+            </div>
+          )}
+
+          {/* ============ RESULTS ============ */}
+          {status === "done" && marketData && strategy && (
+            <div className="animate-in">
+
+              {/* Market Data Bar */}
+              <div style={{
+                background: "white", borderRadius: 12, padding: "16px 20px",
+                border: "1px solid #e2e8f0", marginBottom: 14,
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: "#64748b" }}>MARKET DATA</span>
+                  <span style={{ fontSize: 11, color: "#94a3b8" }}>{marketData.dataDate} · {marketData.sources}</span>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 8 }}>
+                  {[
+                    { l: "Price", v: `$${marketData.price.toFixed(2)}` },
+                    { l: "30D IV", v: `${(marketData.iv*100).toFixed(1)}%` },
+                    { l: "50D SMA", v: `$${marketData.sma50.toFixed(2)}` },
+                    { l: "2W Ago", v: `$${marketData.price2wAgo.toFixed(2)}` },
+                    { l: "Earnings?", v: marketData.earningsNearby ? "YES ⚠️" : "NO" },
+                  ].map(({ l, v }) => (
+                    <div key={l} style={{ textAlign: "center" }}>
+                      <div style={{ fontSize: 10, color: "#94a3b8", fontWeight: 600 }}>{l}</div>
+                      <div style={{ fontSize: 15, fontWeight: 700, color: "#1e293b", marginTop: 2 }}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* THE BIG ANSWER */}
+              <div style={{
+                background: strategy.shouldSkip
+                  ? "linear-gradient(135deg,#fef2f2,#fee2e2)"
+                  : "linear-gradient(135deg,#f0fdf4,#dcfce7)",
+                borderRadius: 14,
+                border: strategy.shouldSkip ? "2px solid #ef4444" : "2px solid #16a34a",
+                padding: "28px 20px", textAlign: "center", marginBottom: 14,
+              }}>
+                {strategy.shouldSkip ? (
+                  <>
+                    <div style={{ fontSize: 42 }}>⚠️</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: "#b91c1c" }}>SKIP THIS TRADE</div>
+                    <div style={{ fontSize: 13, color: "#991b1b", marginTop: 6 }}>
+                      Extreme IV + price below SMA — sit this one out
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{ fontSize: 11, letterSpacing: 2, color: "#15803d", fontWeight: 600 }}>
+                      SELL THIS CALL STRIKE
+                    </div>
+                    <div style={{ fontSize: 58, fontWeight: 900, color: "#15803d", marginTop: 4 }}>
+                      ${strategy.strike}
+                    </div>
+                    <div style={{ fontSize: 13, color: "#166534", marginTop: 6 }}>
+                      {(strategy.totalOtm*100).toFixed(1)}% OTM · ~${strategy.premium.toFixed(2)}/share · 
+                      ${(strategy.premium*100).toFixed(0)}/contract · {(strategy.probOTM*100).toFixed(0)}% chance OTM at expiry
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {/* Strategy Breakdown */}
+              <div style={{
+                background: "white", borderRadius: 12, padding: "16px 20px",
+                border: "1px solid #e2e8f0", marginBottom: 14,
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: "#64748b" }}>BREAKDOWN</span>
+                  <span style={{
+                    padding: "3px 10px", borderRadius: 6, fontSize: 12, fontWeight: 700,
+                    background: rc.bg, border: `1px solid ${rc.border}`, color: rc.text,
+                  }}>{strategy.regime} IV</span>
+                </div>
+
+                {[
+                  { l: "Base OTM", v: strategy.baseOtm, d: `${strategy.regime} regime` },
+                  { l: "Momentum", v: strategy.momentumAdj, d: strategy.momentumAdj>0?"Rally→widen":strategy.momentumAdj<0?"Decline→tighten":"Neutral" },
+                  { l: "Trend (SMA)", v: strategy.trendAdj, d: strategy.trendAdj>0?"Above SMA":strategy.trendAdj<0?"Below SMA":"Near SMA" },
+                  { l: "Earnings", v: strategy.earningsAdj, d: strategy.earningsAdj>0?"Earnings buffer":"No earnings" },
+                ].map(({ l, v, d }) => (
+                  <div key={l} style={{
+                    display: "flex", justifyContent: "space-between", alignItems: "center",
+                    padding: "7px 10px", borderRadius: 6, marginBottom: 4,
+                    background: v !== 0 ? "#f8fafc" : "transparent",
+                  }}>
+                    <div>
+                      <span style={{ fontWeight: 600, fontSize: 13 }}>{l}</span>
+                      <span style={{ fontSize: 11, color: "#94a3b8", marginLeft: 8 }}>{d}</span>
+                    </div>
+                    <span style={{
+                      fontWeight: 700, fontSize: 14, fontFamily: "monospace",
+                      color: v>0?"#16a34a":v<0?"#dc2626":"#94a3b8",
+                    }}>{v>=0?"+":""}{(v*100).toFixed(1)}%</span>
+                  </div>
+                ))}
+
+                <div style={{
+                  display: "flex", justifyContent: "space-between", padding: "10px 12px",
+                  borderRadius: 6, background: "#1e3a5f", color: "white", marginTop: 4,
+                }}>
+                  <span style={{ fontWeight: 700, fontSize: 14 }}>= Total OTM</span>
+                  <span style={{ fontWeight: 800, fontSize: 18, fontFamily: "monospace" }}>
+                    {(strategy.totalOtm*100).toFixed(1)}%
+                  </span>
+                </div>
+              </div>
+
+              {/* Quick Stats */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 14 }}>
+                {[
+                  { l: "Position", v: strategy.posPct, c: "#475569" },
+                  { l: "Delta", v: strategy.delta.toFixed(3), c: "#2563eb" },
+                  { l: "1σ Move", v: `±$${strategy.expectedMove.toFixed(1)}`, c: "#7c3aed" },
+                  { l: "P(OTM)", v: `${(strategy.probOTM*100).toFixed(0)}%`, c: "#16a34a" },
+                ].map(({ l, v, c }) => (
+                  <div key={l} style={{
+                    background: "white", borderRadius: 10, padding: 12,
+                    textAlign: "center", border: "1px solid #e2e8f0",
+                  }}>
+                    <div style={{ fontSize: 10, color: "#94a3b8", fontWeight: 600 }}>{l}</div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: c, marginTop: 3 }}>{v}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Execution Checklist */}
+              <div style={{
+                background: "#fffbeb", borderRadius: 12, padding: 16,
+                border: "1px solid #fbbf24", marginBottom: 14,
+              }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#92400e", marginBottom: 8 }}>
+                  📋 EXECUTION CHECKLIST
+                </div>
+                {[
+                  "Open your broker → TSLA Options Chain",
+                  `Select expiration ~14 days out`,
+                  `Find the $${strategy.strike} CALL`,
+                  "Sell to Open 1 contract (Covered Call)",
+                  "Use LIMIT order at mid-price",
+                  `Log: Strike=$${strategy.strike}, Prem≈$${strategy.premium.toFixed(2)}/sh`,
+                ].map((s, i) => (
+                  <div key={i} style={{
+                    display: "flex", gap: 8, alignItems: "center",
+                    padding: "5px 0", fontSize: 13, color: "#78350f",
+                  }}>
+                    <span style={{
+                      width: 20, height: 20, borderRadius: "50%",
+                      border: "2px solid #f59e0b", display: "flex",
+                      alignItems: "center", justifyContent: "center",
+                      fontSize: 10, fontWeight: 700, flexShrink: 0,
+                    }}>{i+1}</span>
+                    <span>{s}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* TRADE HISTORY */}
+          {history.length > 0 && (
+            <div style={{
+              background: "white", borderRadius: 12, padding: "16px 20px",
+              border: "1px solid #e2e8f0", marginTop: 20,
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <span style={{ fontSize: 12, fontWeight: 700, color: "#64748b" }}>
+                  TRADE HISTORY ({history.length} entries)
+                </span>
+                <button onClick={() => { setHistory([]); try{localStorage.removeItem("tsla_cc_history")}catch(e){} }}
+                  style={{
+                    fontSize: 11, color: "#94a3b8", background: "none", border: "none",
+                    cursor: "pointer", textDecoration: "underline",
+                  }}>Clear</button>
+              </div>
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ background: "#f1f5f9" }}>
+                      {["Date","Price","IV","Regime","Strike","OTM%","Est. Prem"].map(h => (
+                        <th key={h} style={{
+                          padding: "6px 10px", textAlign: "center",
+                          fontWeight: 600, color: "#64748b", borderBottom: "1px solid #e2e8f0",
+                        }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {history.map((h, i) => (
+                      <tr key={i} style={{ background: i%2===0 ? "white" : "#f8fafc" }}>
+                        <td style={{ padding: "6px 10px", textAlign: "center" }}>{h.date}</td>
+                        <td style={{ padding: "6px 10px", textAlign: "center", fontWeight: 600 }}>${h.price?.toFixed(2)}</td>
+                        <td style={{ padding: "6px 10px", textAlign: "center" }}>{(h.iv*100).toFixed(1)}%</td>
+                        <td style={{ padding: "6px 10px", textAlign: "center" }}>
+                          <span style={{
+                            padding: "2px 8px", borderRadius: 4, fontSize: 11, fontWeight: 600,
+                            background: regimeColors[h.regime]?.bg, color: regimeColors[h.regime]?.text,
+                          }}>{h.regime}</span>
+                        </td>
+                        <td style={{ padding: "6px 10px", textAlign: "center", fontWeight: 700, color: "#15803d" }}>${h.strike}</td>
+                        <td style={{ padding: "6px 10px", textAlign: "center" }}>{(h.otm*100).toFixed(1)}%</td>
+                        <td style={{ padding: "6px 10px", textAlign: "center" }}>${h.premium?.toFixed(2)}/sh</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Footer */}
+          <div style={{
+            textAlign: "center", padding: "20px 0 10px", fontSize: 10, color: "#94a3b8",
+          }}>
+            TSLA Covered Call Strategy Advisor · Not investment advice · Black-Scholes model estimates
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
